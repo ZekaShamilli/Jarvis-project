@@ -6,5 +6,6 @@ pyperclip
 sounddevice
 numpy
 faster-whisper
+edge-tts
 pywebview
 pillow
