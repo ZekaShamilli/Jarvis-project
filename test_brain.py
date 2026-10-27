@@ -24,6 +24,22 @@ with tempfile.TemporaryDirectory() as d:
     loaded = brain.load_memory(path)
     assert len(loaded["history"]) == brain.HISTORY_LIMIT and loaded["history"][-1]["content"] == "99"
 
+with tempfile.TemporaryDirectory() as d:
+    brain.FILE_ROOTS, brain.BACKUP_DIR = [Path(d)], Path(d) / "backups"
+    f = Path(d) / "sub" / "notes.txt"
+    assert "Created" in brain.write_file(str(f), "hello world")
+    assert brain.read_file(str(f)) == "hello world"
+    assert "Edited" in brain.edit_file(str(f), "world", "Jarvis")
+    assert f.read_text(encoding="utf-8") == "hello Jarvis"
+    assert "not found" in brain.edit_file(str(f), "nope", "x")
+    f.write_text("a a", encoding="utf-8")
+    assert "2 times" in brain.edit_file(str(f), "a", "b") and f.read_text(encoding="utf-8") == "a a"
+    assert "Overwrote" in brain.write_file(str(f), "new")
+    assert len(list(brain.BACKUP_DIR.iterdir())) == 2  # one per edit/overwrite
+    assert "notes.txt" in brain.list_files(str(f.parent))
+    assert "outside the allowed folders" in brain.run_tool("read_file", '{"path": "C:/Windows/win.ini"}', ui=None)
+    assert "outside the allowed folders" in brain.run_tool("write_file", '{"path": "Desktop/x.txt", "content": ""}', ui=None)
+
 assert "Error in nope" in brain.run_tool("nope", "{}", ui=None)
 assert "Error in open_app" in brain.run_tool("open_app", "not json", ui=None)
 

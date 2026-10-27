@@ -23,6 +23,12 @@ MAX_TOOL_ROUNDS = 5
 MAX_SCREEN_STEPS = 15
 SCREENSHOT_WIDTH = 1280
 
+# File tools only touch these folders: your user folder plus JARVIS_FILE_ROOTS (separated by ';').
+FILE_ROOTS = [Path.home()] + [Path(p) for p in os.getenv("JARVIS_FILE_ROOTS", "").split(os.pathsep) if p.strip()]
+BACKUP_DIR = DOCS_DIR / "backups"
+MAX_READ_CHARS = 20000      # keeps a big file from flooding the small model's context
+MAX_LIST_ENTRIES = 100
+
 local = OpenAI(base_url=os.getenv("OLLAMA_URL", "http://localhost:11434/v1"), api_key="ollama")
 # Non-thinking 4B: fits fully in a 6 GB GPU and answers in ~1s; thinking models took 10-150s.
 LOCAL_MODEL = os.getenv("LOCAL_MODEL", "qwen3:4b-instruct")
@@ -114,6 +120,59 @@ def draft_email(to, subject, body):
     return "Email draft opened. The user must review and press Send."
 
 
+def user_path(path):
+    """Relative paths start at the user folder. Refuses anything outside FILE_ROOTS."""
+    p = (Path.home() / os.path.expandvars(path.strip().strip('"'))).expanduser().resolve()
+    if not any(p.is_relative_to(root.resolve()) for root in FILE_ROOTS):
+        raise PermissionError(f"{p} is outside the allowed folders: {', '.join(map(str, FILE_ROOTS))}")
+    return p
+
+
+def backup(p):
+    """Copy a file before Jarvis changes it, so nothing is lost."""
+    import shutil
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    shutil.copy2(p, BACKUP_DIR / f"{stamp}_{p.name}")
+
+
+def list_files(folder):
+    p = user_path(folder)
+    entries = sorted(p.iterdir(), key=lambda e: (e.is_file(), e.name.lower()))
+    lines = [e.name + ("\\" if e.is_dir() else "") for e in entries[:MAX_LIST_ENTRIES]]
+    more = f"\n…and {len(entries) - MAX_LIST_ENTRIES} more" if len(entries) > MAX_LIST_ENTRIES else ""
+    return f"{p}:\n" + ("\n".join(lines) or "(empty)") + more
+
+
+def read_file(path):
+    p = user_path(path)
+    text = p.read_text(encoding="utf-8", errors="replace")
+    cut = f"\n…[cut, {len(text) - MAX_READ_CHARS} more chars]" if len(text) > MAX_READ_CHARS else ""
+    return text[:MAX_READ_CHARS] + cut
+
+
+def write_file(path, content):
+    p = user_path(path)
+    existed = p.exists()
+    if existed:
+        backup(p)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content, encoding="utf-8")
+    return f"{'Overwrote' if existed else 'Created'} {p}."
+
+
+def edit_file(path, find, replace):
+    p = user_path(path)
+    text = p.read_text(encoding="utf-8")
+    count = text.count(find)
+    if count != 1:
+        return (f"'{find}' was not found in {p}; read_file it first and copy the text exactly." if count == 0
+                else f"'{find}' appears {count} times in {p}; include more surrounding text so it's unique.")
+    backup(p)
+    p.write_text(text.replace(find, replace), encoding="utf-8")
+    return f"Edited {p}."
+
+
 def remember(fact):
     mem["facts"].append(fact)
     save_memory(mem)
@@ -138,13 +197,21 @@ TOOLS = [
             title="Document title", content="Full document text"),
     _schema("draft_email", "Open an email draft (never sends).", to="Recipient address",
             subject="Subject", body="Body text"),
+    _schema("list_files", "List what is inside a folder, e.g. Desktop or Documents.", folder="Folder path"),
+    _schema("read_file", "Read a text file (txt, md, py, json, csv…).", path="File path"),
+    _schema("write_file", "Create a new text file, or replace a whole file's content.",
+            path="File path, e.g. Desktop/notes.txt", content="Full file content"),
+    _schema("edit_file", "Change part of a text file: replace an exact piece of its text. "
+            "Use read_file first so 'find' matches exactly.",
+            path="File path", find="Exact existing text", replace="New text"),
     _schema("remember", "Save a fact about the user for later.", fact="The fact"),
     _schema("use_screen", "Look at the screen and click/type to do a task inside an app, "
             "only when no other tool can do it.", task="What to do, step by step"),
 ]
 TOOL_FUNCS = {"open_app": open_app, "open_url": open_url, "youtube_search": youtube_search,
               "web_search": web_search, "write_word_doc": write_word_doc,
-              "draft_email": draft_email, "remember": remember}
+              "draft_email": draft_email, "remember": remember, "list_files": list_files,
+              "read_file": read_file, "write_file": write_file, "edit_file": edit_file}
 
 
 def run_tool(name, raw_args, ui):
@@ -166,7 +233,8 @@ def system_prompt():
         "You are Jarvis, a fast desktop assistant on the user's Windows PC. "
         "Do what the user asks by calling tools; don't just describe it. "
         "Reply briefly in the user's language (Turkish or English). "
-        f"Today is {datetime.date.today()}.\n"
+        f"Today is {datetime.date.today()}. User folder: {Path.home()} "
+        f"(Desktop, Documents, Downloads are inside it). File tools may use: {', '.join(map(str, FILE_ROOTS))}.\n"
         f"Facts about the user:\n{facts}\n"
         f"Sites opened before (newest last), use these for 'the site I mentioned':\n{sites}\n/no_think"
     )

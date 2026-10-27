@@ -5,6 +5,8 @@ or type. It answers on a card and out loud.
 
 - **Fast path (local, free):** Ollama + `qwen3:4b-instruct` picks a tool: open apps/sites, YouTube/Google search,
   write a Word document, draft an email (never sends), remember facts. Remembers sites you opened.
+- **Files:** list folders, read, create and edit text files. Only inside your user folder plus any folders in
+  `JARVIS_FILE_ROOTS`; every overwrite/edit first copies the old file to `Documents\Jarvis\backups`. No deleting.
 - **Screen path (Azure credits):** for things only clicking can do, an Azure vision model looks at the
   screen and clicks/types. Slam the mouse into a screen corner to abort.
 
