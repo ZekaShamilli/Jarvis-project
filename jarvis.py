@@ -1,9 +1,9 @@
 """Jarvis: floating bar at the top of the screen. Run: python jarvis.py"""
+import contextlib
 import json
 import os
 import re
 import subprocess
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -33,13 +33,7 @@ WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
 
 # Neural voices via edge-tts (online, free). List others: edge-tts --list-voices
 VOICES = {"en-US": os.getenv("JARVIS_VOICE", "en-GB-RyanNeural"), "tr-TR": "tr-TR-AhmetNeural"}
-VOICE_FILE = Path(tempfile.gettempdir()) / "jarvis_voice.mp3"
-PLAY_PS = (
-    "Add-Type -AssemblyName PresentationCore;"
-    "$p=New-Object System.Windows.Media.MediaPlayer;$p.Open([uri]$env:JARVIS_AUDIO);"
-    "while(-not $p.NaturalDuration.HasTimeSpan){Start-Sleep -m 20};$p.Play();"
-    "Start-Sleep -m ([int]$p.NaturalDuration.TimeSpan.TotalMilliseconds+150)"
-)
+VOICE_RATE = 24000
 # Offline fallback: built-in Windows SAPI voice.
 SPEAK_PS = (
     "[Console]::InputEncoding=[Text.Encoding]::UTF8;"
@@ -59,6 +53,7 @@ class Api:
         self._lock = threading.Lock()
         self._whisper = None
         self._voice = None
+        self._voice_stop = threading.Event()
         self._anim_gen = 0
         self._hwnd = None
         self._geo = None            # (center_x, top, dpi_scale) in physical pixels
@@ -182,25 +177,56 @@ class Api:
     def _speak(self, text):
         if not SPEAK:
             return
+        self._voice_stop.set()  # cut off whatever is still talking
         if self._voice and self._voice.poll() is None:
             self._voice.kill()
-        text = text[:MAX_SPOKEN_CHARS]
+        stop = self._voice_stop = threading.Event()
+        threading.Thread(target=self._say, args=(text[:MAX_SPOKEN_CHARS], stop), daemon=True).start()
+
+    def _say(self, text, stop):
+        import asyncio
         lang = "tr-TR" if re.search("[çğıöşüÇĞİÖŞÜ]", text) else "en-US"
         try:
-            import asyncio
-            import edge_tts
-            asyncio.run(edge_tts.Communicate(text, VOICES[lang]).save(str(VOICE_FILE)))
-            self._voice = subprocess.Popen(
-                ["powershell", "-NoProfile", "-Command", PLAY_PS],
-                env={**os.environ, "JARVIS_AUDIO": str(VOICE_FILE)}, creationflags=subprocess.CREATE_NO_WINDOW)
+            asyncio.run(stream_voice(text, VOICES[lang], stop))
             return
         except Exception:
-            pass  # offline or edge-tts missing: fall back to SAPI below
+            if stop.is_set():
+                return
+            # offline or edge-tts missing: fall back to SAPI below
         self._voice = subprocess.Popen(
             ["powershell", "-NoProfile", "-Command", SPEAK_PS], stdin=subprocess.PIPE,
             env={**os.environ, "JARVIS_LANG": lang}, creationflags=subprocess.CREATE_NO_WINDOW)
         self._voice.stdin.write(text.encode("utf-8"))
         self._voice.stdin.close()
+
+
+async def stream_voice(text, voice, stop):
+    """Play edge-tts mp3 as it arrives, so speech starts before synthesis finishes.
+    Raises only if nothing was played, so the caller can fall back to SAPI."""
+    import av
+    import edge_tts
+    import numpy as np
+    import sounddevice as sd
+    codec = av.CodecContext.create("mp3", "r")
+    resample = av.AudioResampler(format="flt", layout="mono", rate=VOICE_RATE)
+    chunks = edge_tts.Communicate(text, voice).stream()
+    played = False
+    try:
+        async with contextlib.aclosing(chunks):  # closes the connection if we stop mid-stream
+            with sd.OutputStream(samplerate=VOICE_RATE, channels=1, dtype="float32") as out:
+                async for msg in chunks:
+                    if msg["type"] != "audio":
+                        continue
+                    for p in codec.parse(msg["data"]):
+                        for frame in (f for d in codec.decode(p) for f in resample.resample(d)):
+                            if stop.is_set():
+                                out.abort()
+                                return
+                            out.write(np.ascontiguousarray(frame.to_ndarray().reshape(-1, 1)))
+                            played = True
+    except Exception:
+        if not played:
+            raise
 
 
 def style_window(api):
