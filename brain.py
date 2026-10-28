@@ -17,7 +17,8 @@ load_dotenv(HERE / ".env")
 
 MEMORY_FILE = HERE / "memory.json"
 DOCS_DIR = Path.home() / "Documents" / "Jarvis"
-HISTORY_LIMIT = 40          # chat messages sent to the model
+HISTORY_LIMIT = 60          # messages (incl. tool calls/results) sent to the model
+HISTORY_TOOL_CHARS = 400    # tool results are cut to this in history so file reads don't flood it
 URL_LIMIT = 30              # remembered sites shown to the model
 MAX_TOOL_ROUNDS = 5
 MAX_SCREEN_STEPS = 15
@@ -54,8 +55,16 @@ def load_memory(path=MEMORY_FILE):
         return {"history": [], "urls": [], "facts": []}
 
 
+def recent(history, limit=HISTORY_LIMIT):
+    """Last `limit` messages, starting at a user turn so no tool result loses its tool call."""
+    tail = history[-limit:]
+    while tail and tail[0]["role"] != "user":
+        tail = tail[1:]
+    return tail
+
+
 def save_memory(mem, path=MEMORY_FILE):
-    trimmed = {**mem, "history": mem["history"][-HISTORY_LIMIT:], "urls": mem["urls"][-URL_LIMIT:]}
+    trimmed = {**mem, "history": recent(mem["history"]), "urls": mem["urls"][-URL_LIMIT:]}
     path.write_text(json.dumps(trimmed, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
@@ -207,7 +216,11 @@ TOOLS = [
     _schema("remember", "Save a fact about the user for later.", fact="The fact"),
     _schema("use_screen", "Look at the screen and click/type to do a task inside an app, "
             "only when no other tool can do it.", task="What to do, step by step"),
+    _schema("reply", "Talk to the user: answer a question or chat. NEVER use this to say you opened, "
+            "created, saved or did something; call that action's tool instead.", text="What to say"),
 ]
+# Tools whose output the model must read before answering; every other tool's result is reported as-is.
+INFO_TOOLS = {"list_files", "read_file"}
 TOOL_FUNCS = {"open_app": open_app, "open_url": open_url, "youtube_search": youtube_search,
               "web_search": web_search, "write_word_doc": write_word_doc,
               "draft_email": draft_email, "remember": remember, "list_files": list_files,
@@ -231,8 +244,8 @@ def system_prompt():
     facts = "\n".join(f"- {f}" for f in mem["facts"]) or "none"
     return (
         "You are Jarvis, a fast desktop assistant on the user's Windows PC. "
-        "Do what the user asks by calling tools; don't just describe it. "
-        "Reply briefly in the user's language (Turkish or English). "
+        "Always respond by calling tools. To do something, call its tool; saying it is done does nothing. "
+        "Use the reply tool only to talk. Reply briefly in the user's language (Turkish or English). "
         f"Today is {datetime.date.today()}. User folder: {Path.home()} "
         f"(Desktop, Documents, Downloads are inside it). File tools may use: {', '.join(map(str, FILE_ROOTS))}.\n"
         f"Facts about the user:\n{facts}\n"
@@ -245,23 +258,75 @@ def strip_think(text):
 
 
 def ask(user_text, ui):
-    """ui needs .status(str) and .set_visible(bool)."""
-    mem["history"].append({"role": "user", "content": user_text})
-    messages = [{"role": "system", "content": system_prompt()}] + mem["history"][-HISTORY_LIMIT:]
-    reply = "Done."
+    """ui needs .status(str) and .set_visible(bool).
+
+    The answer is built from what the tools really did, never from the model's own claims:
+    small models happily say "Word is open!" without opening anything."""
+    turn = [{"role": "user", "content": user_text}]  # saved to history with the real tool calls
+    messages = [{"role": "system", "content": system_prompt()}] + recent(mem["history"]) + turn
+    said, did, nudged = [], [], False
     for _ in range(MAX_TOOL_ROUNDS):
-        msg = local.chat.completions.create(model=LOCAL_MODEL, messages=messages, tools=TOOLS).choices[0].message
-        if not msg.tool_calls:
-            reply = strip_think(msg.content) or reply
+        msg = local.chat.completions.create(model=LOCAL_MODEL, messages=messages, tools=TOOLS,
+                                            tool_choice="required").choices[0].message
+        if not msg.tool_calls:  # Ollama ignores tool_choice, so plain text still happens
+            text = strip_think(msg.content)
+            if not claims_action(text):
+                said.append(text)
+            elif not nudged:
+                nudged = True
+                messages.append({"role": "system", "content": "You did not call any tool, so nothing "
+                                 "happened. Call the correct tool now."})
+                continue
+            else:
+                said.append(NOTHING_DONE)
             break
-        messages.append(msg.model_dump(exclude_none=True))
+        call_msg = msg.model_dump(exclude_none=True)
+        messages.append(call_msg)
+        turn.append(call_msg)
+        needs_followup = False
         for call in msg.tool_calls:
-            ui.status(f"Acting: {call.function.name}…")
-            result = run_tool(call.function.name, call.function.arguments, ui)
+            name = call.function.name
+            if name == "reply":
+                result = said_text = _reply_text(call.function.arguments)
+                said.append(said_text)
+            else:
+                ui.status(f"Acting: {name}…")
+                result = run_tool(name, call.function.arguments, ui)
+                if name in INFO_TOOLS and not result.startswith("Error"):
+                    needs_followup = True  # the model has to read this and answer
+                else:
+                    did.append(result)
             messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
-    mem["history"].append({"role": "assistant", "content": reply})
+            turn.append({"role": "tool", "tool_call_id": call.id, "content": result[:HISTORY_TOOL_CHARS]})
+        if said or not needs_followup:
+            break
+    reply = compose_reply(did, said)
+    mem["history"] += turn + [{"role": "assistant", "content": reply}]
     save_memory(mem)
     return reply
+
+
+def _reply_text(raw_args):
+    try:
+        return str(json.loads(raw_args or "{}").get("text", "")).strip()
+    except json.JSONDecodeError:
+        return ""
+
+
+NOTHING_DONE = "I couldn't do that, nothing was done. Try saying it another way."
+# ponytail: keyword check for "I did it" text without a tool call; extend the list if a new phrasing slips through.
+CLAIM_RE = re.compile(r"\b(opened|is (now )?open|created|saved|wrote|written|i'?ll remember|i will remember|"
+                      r"searched|launched|started)\b|açtım|açıldı|oluşturdum|kaydettim|yazdım|hatırlayacağım|"
+                      r"aradım|başlattım", re.I)
+
+
+def claims_action(text):
+    return bool(CLAIM_RE.search(text or ""))
+
+
+def compose_reply(did, said):
+    """Real tool results first, then whatever the model wanted to say."""
+    return "\n".join(p for p in [*did, *said] if p) or NOTHING_DONE
 
 
 # ---------- screen agent (Azure) ----------

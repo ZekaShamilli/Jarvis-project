@@ -43,4 +43,20 @@ with tempfile.TemporaryDirectory() as d:
 assert "Error in nope" in brain.run_tool("nope", "{}", ui=None)
 assert "Error in open_app" in brain.run_tool("open_app", "not json", ui=None)
 
+# History trimming never starts on an orphaned tool result.
+hist = [{"role": "user", "content": "a"}, {"role": "assistant", "tool_calls": []},
+        {"role": "tool", "content": "r"}, {"role": "assistant", "content": "x"}, {"role": "user", "content": "b"}]
+assert brain.recent(hist, limit=3) == [{"role": "user", "content": "b"}]
+assert brain.recent(hist, limit=5) == hist
+
+# "I did it" text without a tool call is caught; normal chat is not.
+for claim in ["Word is now open!", "I've opened Paint", "I've created notlar.txt", "Word'ü açtım", "I'll remember that"]:
+    assert brain.claims_action(claim), claim
+for chat in ["The capital of France is Paris.", "15 times 3 is 45.", "Merhaba! Nasıl yardımcı olabilirim?"]:
+    assert not brain.claims_action(chat), chat
+
+# The answer is built from real tool results; empty means nothing happened.
+assert brain.compose_reply(["Opened https://gmail.com."], ["Anything else?"]) == "Opened https://gmail.com.\nAnything else?"
+assert brain.compose_reply([], []) == brain.NOTHING_DONE
+
 print("all checks passed")

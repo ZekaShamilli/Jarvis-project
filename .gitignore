@@ -3,3 +3,4 @@ __pycache__/
 .env
 memory.json
 *.log
+memory.backup.json
